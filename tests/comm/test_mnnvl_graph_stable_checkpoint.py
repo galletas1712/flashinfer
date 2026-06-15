@@ -21,10 +21,11 @@ from flashinfer.comm.mnnvl import MnnvlConfig, MnnvlMemory, _MnnvlAllocationReco
 
 
 class _FakeComm:
-    def __init__(self, size: int = 2, rank: int = 0):
+    def __init__(self, size: int = 2, rank: int = 0, values=None):
         self.size = size
         self.rank = rank
         self.barriers = 0
+        self.values = values
 
     def Get_size(self):
         return self.size
@@ -33,6 +34,8 @@ class _FakeComm:
         return self.rank
 
     def allgather(self, value):
+        if self.values is not None:
+            return self.values
         return [value] * self.size
 
     def barrier(self):
@@ -77,6 +80,8 @@ def fake_mnnvl_state():
             0x1000: _MnnvlAllocationRecord(
                 mapping=object(),
                 comm=fake_comm,
+                comm_size=2,
+                comm_rank=0,
                 aligned_size=0x1000,
                 mem_handles=["handle0", "handle1"],
                 start_address=0x1000,
@@ -213,8 +218,71 @@ def test_remap_refreshes_comm_from_current_config(monkeypatch, fake_mnnvl_state)
     )
 
 
+def test_remap_rejects_changed_comm_before_mapping(monkeypatch, fake_mnnvl_state):
+    record = MnnvlMemory.allocated_map[0x1000]
+    record.mapped = False
+    record.mem_handles = [None, None]
+    config = MnnvlConfig(comm_backend=SimpleNamespace())
+
+    def _refresh(mapping, refresh_config):
+        return _FakeComm(size=3, rank=0)
+
+    def _remap(*args, **kwargs):
+        raise AssertionError("remap should not run with changed communicator")
+
+    monkeypatch.setattr(MnnvlMemory, "refresh_comm_from_config", _refresh)
+    monkeypatch.setattr(MnnvlMemory, "_create_and_map_mnnvl_handles", _remap)
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        MnnvlMemory.remap_mnnvl_memory_same_va(0x1000, config=config)
+
+
 def test_remap_config_requires_detached_allocation(fake_mnnvl_state):
     config = MnnvlConfig(comm_backend=SimpleNamespace())
 
     with pytest.raises(RuntimeError, match="still mapped"):
         MnnvlMemory.remap_mnnvl_memory_same_va(0x1000, config=config)
+
+
+def test_posix_handle_exchange_closes_exported_and_pidfds(monkeypatch):
+    fake_comm = _FakeComm(values=[10, 11])
+    closed = []
+
+    class _FakeCuda:
+        class CUmemAllocationHandleType:
+            CU_MEM_HANDLE_TYPE_FABRIC = "fabric"
+            CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR = "posix"
+
+        def cuMemExportToShareableHandle(
+            self, allocated_mem_handle, handle_type, flags
+        ):
+            posix_fd = (
+                self.CUmemAllocationHandleType
+                .CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+            )
+            assert handle_type == posix_fd
+            return (SimpleNamespace(value=0), 7)
+
+    syscall_results = iter([100, 200, 101, 201])
+
+    class _FakeLibc:
+        def syscall(self, number, *args):
+            return next(syscall_results)
+
+    allocation_prop = SimpleNamespace(
+        requestedHandleTypes=(
+            _FakeCuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        )
+    )
+
+    monkeypatch.setattr(mnnvl_mod, "cuda", _FakeCuda())
+    monkeypatch.setattr(mnnvl_mod.ctypes, "CDLL", lambda *args, **kwargs: _FakeLibc())
+    monkeypatch.setattr(mnnvl_mod.os, "close", lambda fd: closed.append(fd))
+
+    remote_fds = MnnvlMemory._exchange_shareable_handles(
+        fake_comm, allocation_prop, "handle"
+    )
+
+    assert remote_fds == [200, 201]
+    assert closed == [100, 101, 7]
+    assert fake_comm.barriers == 1
