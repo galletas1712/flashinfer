@@ -1184,6 +1184,8 @@ class SymmDeviceMemory:
         self.uc_handles: List[
             int
         ] = []  # std::vector<CUmemGenericAllocationHandle> mUcHandles
+        self._graph_visible_addresses: Optional[Dict[str, Any]] = None
+        self._mapped = False
 
         # Signal pad constants
         self.SIGNAL_PAD_ALIGNMENT = 16
@@ -1211,15 +1213,9 @@ class SymmDeviceMemory:
         )
 
         # Create handle exchanger
-        if is_mnnvl_fabric_supported(device_idx):
-            self._exchanger: HandleExchanger = FabricHandleExchanger(
-                self.comm_backend, self.group_rank, self.group_size
-            )
-        else:
-            self._exchanger = PosixFDHandleExchanger(
-                self.comm_backend, self.group_rank, self.group_size
-            )
+        self._exchanger: Optional[HandleExchanger] = self._create_handle_exchanger()
         self._alloc_mn_mcast_mem(buf_size, enable_multicast)
+        self._mapped = True
 
         if allocate_signal_pads:
             # Initialize signal pads
@@ -1233,12 +1229,12 @@ class SymmDeviceMemory:
 
             self.signal_pads_dev = alloc_and_copy_to_cuda(self.signal_pads)
         self.uc_ptrs_dev = alloc_and_copy_to_cuda(self.uc_ptrs)
+        self._graph_visible_addresses = self.get_graph_visible_addresses()
 
     def __del__(self):
         """Destructor - cleanup allocated memory"""
 
-        if hasattr(self, "_exchanger"):
-            self._exchanger.close()
+        self._close_handle_exchanger()
 
         # Skip cleanup during Python finalization to avoid segfaults
         # Especially cause the CUDA context could be destroyed at this point.
@@ -1252,49 +1248,253 @@ class SymmDeviceMemory:
             logger.warning("Destructor: CUDA context invalid, skipping cleanup: %s", e)
             return
 
-        # Free device pointers
+        self._free_pointer_arrays()
+        if getattr(self, "_mapped", False):
+            self._unmap_and_release_physical_handles(log_errors=True)
+            self._mapped = False
+        self._free_va_reservations(log_errors=True)
+
+    def _create_handle_exchanger(self) -> HandleExchanger:
+        if is_mnnvl_fabric_supported(self.device_idx):
+            return FabricHandleExchanger(
+                self.comm_backend, self.group_rank, self.group_size
+            )
+        return PosixFDHandleExchanger(
+            self.comm_backend, self.group_rank, self.group_size
+        )
+
+    def _close_handle_exchanger(self) -> None:
+        exchanger = getattr(self, "_exchanger", None)
+        if exchanger is not None:
+            exchanger.close()
+            self._exchanger = None
+
+    def _validate_comm(self, comm_backend: CommBackend) -> None:
+        comm_size = comm_backend.Get_size()
+        comm_rank = comm_backend.Get_rank()
+        if comm_size != self.group_size or comm_rank != self.group_rank:
+            raise RuntimeError(
+                "Restored symmetric-memory communicator does not match the "
+                "graph-visible allocation layout: "
+                f"rank/size {comm_rank}/{comm_size} != "
+                f"{self.group_rank}/{self.group_size}"
+            )
+
+    def _collective_mapped_states(self, comm_backend: CommBackend) -> List[bool]:
+        mapped_states = comm_backend.allgather(self._mapped)
+        if len(mapped_states) != self.group_size:
+            raise RuntimeError(
+                "Symmetric-memory mapped-state allgather returned "
+                f"{len(mapped_states)} ranks, expected {self.group_size}"
+            )
+        if any(mapped_states) and not all(mapped_states):
+            raise RuntimeError("Inconsistent symmetric-memory mapped state across ranks")
+        return mapped_states
+
+    def _collective_allocation_metadata(self, comm_backend: CommBackend) -> None:
+        local_metadata = {
+            "group_rank": self.group_rank,
+            "group_size": self.group_size,
+            "buf_size": self.buf_size,
+            "allocation_size": self.allocation_size,
+            "signal_pad_offset": self.signal_pad_offset,
+            "total_uc_size": getattr(self, "total_uc_size", 0),
+            "has_multicast": bool(self.mc_ptr),
+        }
+        all_metadata = comm_backend.allgather(local_metadata)
+        if len(all_metadata) != self.group_size:
+            raise RuntimeError(
+                "Symmetric-memory metadata allgather returned "
+                f"{len(all_metadata)} ranks, expected {self.group_size}"
+            )
+        for rank, metadata in enumerate(all_metadata):
+            expected = {**local_metadata, "group_rank": rank}
+            if metadata != expected:
+                raise RuntimeError(
+                    "Inconsistent symmetric-memory allocation metadata across "
+                    f"ranks: rank {rank} has {metadata!r}, expected {expected!r}"
+                )
+
+    def get_graph_visible_addresses(self) -> Dict[str, Any]:
+        """Return the VA/layout state captured by graph-visible tensors."""
+        return {
+            "buf_size": self.buf_size,
+            "group_size": self.group_size,
+            "group_rank": self.group_rank,
+            "device_idx": self.device_idx,
+            "allocation_size": self.allocation_size,
+            "signal_pad_offset": self.signal_pad_offset,
+            "total_uc_size": getattr(self, "total_uc_size", 0),
+            "uc_base_ptr": int(getattr(self, "uc_base_ptr", 0)),
+            "uc_ptrs": list(self.uc_ptrs),
+            "uc_ptrs_dev": int(self.uc_ptrs_dev),
+            "signal_pads": list(self.signal_pads),
+            "signal_pads_dev": int(self.signal_pads_dev),
+            "mc_ptr": int(self.mc_ptr),
+            "has_multicast": bool(self.mc_ptr),
+        }
+
+    def validate_graph_visible_addresses(
+        self, expected: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Validate that graph-visible VAs and pointer arrays are stable."""
+        expected = expected or self._graph_visible_addresses
+        if expected is None:
+            raise RuntimeError("Missing captured symmetric-memory address metadata")
+        current = self.get_graph_visible_addresses()
+        if set(current) != set(expected):
+            raise RuntimeError(
+                "Symmetric-memory graph-visible metadata fields changed: "
+                f"{sorted(current)} != {sorted(expected)}"
+            )
+        for key, expected_value in expected.items():
+            if current[key] != expected_value:
+                raise RuntimeError(
+                    f"Symmetric-memory graph-visible address field {key} changed: "
+                    f"{current[key]!r} != {expected_value!r}"
+                )
+
+    def _free_pointer_arrays(self) -> None:
         if self.signal_pads_dev:
             checkCudaErrors(cuda.cuMemFree(self.signal_pads_dev))
+            self.signal_pads_dev = 0
         if self.uc_ptrs_dev:
             checkCudaErrors(cuda.cuMemFree(self.uc_ptrs_dev))
+            self.uc_ptrs_dev = 0
 
-        # Unmap UC regions and release their handles
-        if hasattr(self, "uc_handles") and self.uc_handles:
-            for rank in range(self.group_size):
-                if self.uc_handles[rank] != 0:
-                    try:
-                        # Release the handle
-                        checkCudaErrors(cuda.cuMemRelease(self.uc_handles[rank]))
-                        # Unmap the vmem
-                        if rank < len(self.uc_ptrs) and self.uc_ptrs[rank]:
-                            checkCudaErrors(
-                                cuda.cuMemUnmap(
-                                    self.uc_ptrs[rank], self.allocation_size
-                                )
-                            )
-                    except Exception as e:
-                        logger.warning(
-                            "Destructor: Failed to release UC handle for rank %d: %s",
-                            rank,
-                            e,
-                        )
+    def _unmap_and_release_physical_handles(self, *, log_errors: bool = False) -> None:
+        if self.mc_handle:
+            try:
+                checkCudaErrors(cuda.cuMemUnmap(self.mc_ptr, self.allocation_size))
+                checkCudaErrors(cuda.cuMemRelease(self.mc_handle))
+            except Exception as e:
+                if not log_errors:
+                    raise
+                logger.warning("Failed to release MC handle: %s", e)
+            self.mc_handle = 0
 
-            # Free the UC address space
-            if hasattr(self, "uc_base_ptr") and self.uc_base_ptr:
+        for rank, handle in enumerate(self.uc_handles):
+            if handle:
+                try:
+                    checkCudaErrors(
+                        cuda.cuMemUnmap(self.uc_ptrs[rank], self.allocation_size)
+                    )
+                    checkCudaErrors(cuda.cuMemRelease(handle))
+                except Exception as e:
+                    if not log_errors:
+                        raise
+                    logger.warning(
+                        "Failed to release UC handle for rank %d: %s", rank, e
+                    )
+                self.uc_handles[rank] = 0
+
+    def _free_va_reservations(self, *, log_errors: bool = False) -> None:
+        if getattr(self, "uc_base_ptr", 0):
+            try:
                 checkCudaErrors(
                     cuda.cuMemAddressFree(self.uc_base_ptr, self.total_uc_size)
                 )
-
-        # Release MC handle
-        if hasattr(self, "mc_handle") and self.mc_handle and self.mc_handle != 0:
+            except Exception as e:
+                if not log_errors:
+                    raise
+                logger.warning("Failed to free UC VA: %s", e)
+            self.uc_base_ptr = 0
+            self.total_uc_size = 0
+        if self.mc_ptr:
             try:
-                checkCudaErrors(cuda.cuMemUnmap(self.mc_ptr, self.allocation_size))
                 checkCudaErrors(
                     cuda.cuMemAddressFree(self.mc_ptr, self.allocation_size)
                 )
-                checkCudaErrors(cuda.cuMemRelease(self.mc_handle))
             except Exception as e:
-                logger.warning("Destructor: Failed to release MC handle: %s", e)
+                if not log_errors:
+                    raise
+                logger.warning("Failed to free MC VA: %s", e)
+            self.mc_ptr = 0
+
+    def detach_handles(
+        self, *, synchronize: bool = True, barrier: bool = True
+    ) -> None:
+        """Release UC/MC physical mappings while preserving graph-visible VAs."""
+        self._validate_comm(self.comm_backend)
+        mapped_states = self._collective_mapped_states(self.comm_backend)
+        if not any(mapped_states):
+            if barrier:
+                self.comm_backend.barrier()
+                self.comm_backend.barrier()
+            return
+        self._collective_allocation_metadata(self.comm_backend)
+        self.validate_graph_visible_addresses()
+        if synchronize:
+            checkCudaErrors(cuda.cuCtxSynchronize())
+        if barrier:
+            self.comm_backend.barrier()
+
+        self._unmap_and_release_physical_handles()
+        self._mapped = False
+        self._close_handle_exchanger()
+
+        if barrier:
+            self.comm_backend.barrier()
+
+    def reattach_handles(
+        self,
+        *,
+        comm: Optional[CommBackend] = None,
+        synchronize: bool = True,
+        barrier: bool = True,
+        zero_local: bool = True,
+    ) -> None:
+        """Create fresh UC/MC backing and map it into the original VAs."""
+        comm_backend = comm or self.comm_backend
+        self._validate_comm(comm_backend)
+        mapped_states = self._collective_mapped_states(comm_backend)
+        if comm_backend is not self.comm_backend and any(mapped_states):
+            raise RuntimeError(
+                "Cannot refresh symmetric-memory communicator while allocation "
+                "is still mapped; call detach_handles before checkpoint reattach"
+            )
+        if all(mapped_states):
+            if barrier:
+                comm_backend.barrier()
+                comm_backend.barrier()
+            return
+        self._collective_allocation_metadata(comm_backend)
+        self.validate_graph_visible_addresses()
+        if synchronize:
+            checkCudaErrors(cuda.cuCtxSynchronize())
+        if barrier:
+            comm_backend.barrier()
+
+        enable_multicast = bool(self.mc_ptr)
+        expected_allocation_size = self.allocation_size
+        self.comm_backend = comm_backend
+        self._exchanger = self._create_handle_exchanger()
+        allocation_prop, mc_prop = self._get_allocation_prop(self.buf_size)
+        if self.allocation_size != expected_allocation_size:
+            raise RuntimeError(
+                "Restored symmetric-memory allocation size changed: "
+                f"{self.allocation_size} != {expected_allocation_size}"
+            )
+
+        self._create_and_import_unicast_handles(allocation_prop)
+        self._map_unicast_buffers()
+        if enable_multicast:
+            self._create_and_import_multicast_handle(mc_prop)
+            self._map_multicast_buffer()
+            self._bind_multicast_to_local_unicast()
+
+        if zero_local:
+            checkCudaErrors(
+                cuda.cuMemsetD8(
+                    self.uc_ptrs[self.group_rank], 0, self.allocation_size
+                )
+            )
+
+        self._mapped = True
+        self.validate_graph_visible_addresses()
+
+        if barrier:
+            self.comm_backend.barrier()
 
     def get_signal_pad_ptrs_host(self) -> List[int]:
         """Get the raw array of signal pad pointers to all ranks (including self)"""
@@ -1414,7 +1614,12 @@ class SymmDeviceMemory:
 
     def _allocate_unicast_buffers(self, allocation_prop):
         """Allocate local UC memory, exchange handles with peers, and map memory."""
-        # Initialize UC handles list
+        self._create_and_import_unicast_handles(allocation_prop)
+        self._reserve_unicast_va()
+        self._map_unicast_buffers()
+
+    def _create_and_import_unicast_handles(self, allocation_prop):
+        """Create local UC memory and import peer handles."""
         self.uc_handles = [0] * self.group_size
 
         # Allocate local GPU memory
@@ -1446,6 +1651,8 @@ class SymmDeviceMemory:
                 )
                 self._exchanger.cleanup(all_shareable_uc_handles[p])
 
+    def _reserve_unicast_va(self):
+        """Reserve graph-visible UC VA and populate per-rank pointers."""
         # Reserve address space for UC pointers
         self.uc_ptrs = [0] * self.group_size
         total_uc_size = self.allocation_size * self.group_size
@@ -1455,10 +1662,14 @@ class SymmDeviceMemory:
         )
         self.uc_base_ptr = uc_base_ptr
 
-        # Map UC memory
         for i in range(self.group_size):
             offset = self.allocation_size * i
             self.uc_ptrs[i] = int(uc_base_ptr) + offset
+
+    def _map_unicast_buffers(self):
+        """Map imported UC handles into the existing UC VA."""
+        # Map UC memory
+        for i in range(self.group_size):
             checkCudaErrors(
                 cuda.cuMemMap(
                     self.uc_ptrs[i], self.allocation_size, 0, self.uc_handles[i], 0
@@ -1468,11 +1679,18 @@ class SymmDeviceMemory:
         # Set memory access permissions for UC
         access_desc = self._get_mem_access_desc()
         checkCudaErrors(
-            cuda.cuMemSetAccess(uc_base_ptr, total_uc_size, [access_desc], 1)
+            cuda.cuMemSetAccess(self.uc_base_ptr, self.total_uc_size, [access_desc], 1)
         )
 
     def _setup_multicast(self, mc_prop):
         """Create multicast object, exchange handle, map memory, and bind."""
+        self._create_and_import_multicast_handle(mc_prop)
+        self._reserve_multicast_va()
+        self._map_multicast_buffer()
+        self._bind_multicast_to_local_unicast()
+
+    def _create_and_import_multicast_handle(self, mc_prop):
+        """Create/import a multicast handle and add this device to it."""
         # Rank 0 creates the multicast object
         if self.group_rank == 0:
             self.mc_handle = checkCudaErrors(cuda.cuMulticastCreate(mc_prop))
@@ -1503,10 +1721,15 @@ class SymmDeviceMemory:
         # Add device to multicast
         checkCudaErrors(cuda.cuMulticastAddDevice(self.mc_handle, self.device_idx))
 
+    def _reserve_multicast_va(self):
+        """Reserve the graph-visible multicast VA."""
         # Reserve and map MC pointer
         self.mc_ptr = checkCudaErrors(
             cuda.cuMemAddressReserve(self.allocation_size, self._mc_granularity, 0, 0)
         )
+
+    def _map_multicast_buffer(self):
+        """Map the multicast handle into the existing multicast VA."""
         checkCudaErrors(
             cuda.cuMemMap(self.mc_ptr, self.allocation_size, 0, self.mc_handle, 0)
         )
@@ -1515,6 +1738,8 @@ class SymmDeviceMemory:
             cuda.cuMemSetAccess(self.mc_ptr, self.allocation_size, [access_desc], 1)
         )
 
+    def _bind_multicast_to_local_unicast(self):
+        """Bind this rank's UC handle into the multicast object."""
         # Bind local memory to multicast
         checkCudaErrors(
             cuda.cuMulticastBindMem(
@@ -1636,3 +1861,57 @@ class McastGPUBuffer:
     def get_buffer_ptrs_dev(self) -> int:
         """Get the buffer pointers device array"""
         return self.mcast_device_memory.get_buffer_ptrs_dev()
+
+    @property
+    def buffer_size(self) -> int:
+        """Return the usable local buffer size, excluding signal padding."""
+        return self.buf_size
+
+    @property
+    def buffer_ptrs(self) -> List[int]:
+        """Return host unicast pointers for all ranks."""
+        return self.mcast_device_memory.get_buffer_ptrs_host()
+
+    @property
+    def buffer_ptrs_dev(self) -> int:
+        """Return the device pointer array of unicast pointers."""
+        return self.mcast_device_memory.get_buffer_ptrs_dev()
+
+    @property
+    def multicast_ptr(self) -> int:
+        """Return the multicast pointer."""
+        return self.mcast_device_memory.get_multicast_ptr()
+
+    def get_graph_visible_addresses(self) -> Dict[str, Any]:
+        """Return graph-visible pointer metadata for this buffer."""
+        return self.mcast_device_memory.get_graph_visible_addresses()
+
+    def validate_graph_visible_addresses(
+        self, expected: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Validate that graph-visible buffer pointers are stable."""
+        self.mcast_device_memory.validate_graph_visible_addresses(expected)
+
+    def detach_handles(
+        self, *, synchronize: bool = True, barrier: bool = True
+    ) -> None:
+        """Detach physical backing while preserving graph-visible VAs."""
+        self.mcast_device_memory.detach_handles(
+            synchronize=synchronize, barrier=barrier
+        )
+
+    def reattach_handles(
+        self,
+        *,
+        comm: Optional[CommBackend] = None,
+        synchronize: bool = True,
+        barrier: bool = True,
+        zero_local: bool = True,
+    ) -> None:
+        """Reattach physical backing at the original graph-visible VAs."""
+        self.mcast_device_memory.reattach_handles(
+            comm=comm,
+            synchronize=synchronize,
+            barrier=barrier,
+            zero_local=zero_local,
+        )

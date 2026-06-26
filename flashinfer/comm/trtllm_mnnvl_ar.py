@@ -14,15 +14,36 @@ import torch
 from typing_extensions import deprecated
 
 from flashinfer.comm.mapping import Mapping
-from flashinfer.comm.mnnvl import TorchDistBackend
-
 from ..jit import gen_trtllm_mnnvl_comm_module
 from ..utils import register_custom_op
 from ..fp4_quantization import _compute_swizzled_layout_sf_size
-from .mnnvl import CommBackend, MPIBackend
+from .mnnvl import CommBackend, McastGPUBuffer, MPIBackend
 from .trtllm_ar import QuantizationSFLayout
 from .workspace_base import AllReduceFusionWorkspace
-from .torch_symmetric_memory import _alloc_symm_buffer_bytes
+
+
+def _snapshot_tensor(tensor: torch.Tensor, prefix: str) -> dict:
+    return {
+        f"{prefix}_data_ptr": int(tensor.data_ptr()),
+        f"{prefix}_shape": tuple(tensor.shape),
+        f"{prefix}_stride": tuple(tensor.stride()),
+        f"{prefix}_dtype": str(tensor.dtype),
+        f"{prefix}_device": str(tensor.device),
+    }
+
+
+def _validate_snapshot(expected: dict, current: dict) -> None:
+    if set(expected) != set(current):
+        raise RuntimeError(
+            "Graph-visible metadata fields changed: "
+            f"{sorted(current)} != {sorted(expected)}"
+        )
+    for key, expected_value in expected.items():
+        if current[key] != expected_value:
+            raise RuntimeError(
+                f"Graph-visible address field {key} changed: "
+                f"{current[key]!r} != {expected_value!r}"
+            )
 
 
 def mpi_barrier():
@@ -146,25 +167,19 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         # support base_gpu_id != 0 scenarios where the actual CUDA device
         # index differs from the TP rank / local_rank.
         device = torch.device("cuda", torch.cuda.current_device())
-        if isinstance(comm_backend, TorchDistBackend):
-            group = (
-                comm_backend._group
-                if comm_backend._group is not None
-                else torch.distributed.group.WORLD
-            )
-            group_name = group.group_name
-        else:
-            group_name = torch.distributed.group.WORLD.group_name
-        self.ptrs, self.tensor, self.handle = _alloc_symm_buffer_bytes(
+        self.handle = McastGPUBuffer(
             requested_workspace_size,
             mapping.tp_size,
-            torch.float32,
+            mapping.tp_rank,
             device,
-            group_name,
+            comm_backend,
         )
+        self.comm_backend = comm_backend
+        self.ptrs = self.handle.buffer_ptrs
+        self.tensor = torch.empty(0, dtype=torch.float32, device=device)
 
-        # handle.buffer_size is the usable data size. torch symmetric memory
-        # allocator places signal_pad on top of it, not carved from within.
+        # handle.buffer_size is the usable data size. SymmDeviceMemory places
+        # signal_pad on top of it, not carved from within.
         allocated_size = self.handle.buffer_size
         # We want the buffer size to be aligned to 16B which is the granularity for buffer management.
         self.buffer_size_bytes = (
@@ -177,8 +192,8 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             f"[MNNVL Allreduce] Actual allocated size: {allocated_size} bytes, Actual buffer size per lamport buffer: {self.buffer_size_bytes} bytes, total workspace: {self.workspace_size_bytes} bytes."
         )
 
-        # lamport initialize tensor to negative zero.
-        self.tensor.fill_(-0.0)
+        # Lamport initialize local workspace buffers to negative zero.
+        self.handle.lamport_initialize(self.rank, torch.float32)
         # Wait until the initialization is done
         torch.cuda.synchronize()
         comm_backend.barrier()
@@ -197,6 +212,7 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         self.uc_ptrs_dev = self.handle.buffer_ptrs_dev
         self.uc_ptr_local = self.handle.buffer_ptrs[self.rank]
         self.mc_ptr = self.handle.multicast_ptr
+        self._graph_visible_addresses = self.get_graph_visible_addresses()
 
     @functools.cache
     def is_buffer_size_sufficient(
@@ -250,6 +266,64 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     @property
     def backend(self) -> str:
         return "mnnvl"
+
+    def get_graph_visible_addresses(self) -> dict:
+        """Return graph-visible pointer metadata for the MNNVL workspace."""
+        return {
+            "ptrs": list(self.ptrs),
+            "uc_ptrs_dev": int(self.uc_ptrs_dev),
+            "uc_ptr_local": int(self.uc_ptr_local),
+            "mc_ptr": int(self.mc_ptr),
+            **_snapshot_tensor(self.buffer_flags, prefix="buffer_flags"),
+            "buffer_size_bytes": self.buffer_size_bytes,
+            "workspace_size_bytes": self.workspace_size_bytes,
+        }
+
+    def validate_graph_visible_addresses(self) -> None:
+        """Validate that all graph-visible workspace pointers are stable."""
+        _validate_snapshot(
+            self._graph_visible_addresses, self.get_graph_visible_addresses()
+        )
+        self.handle.validate_graph_visible_addresses()
+
+    def detach_handles(
+        self, *, synchronize: bool = True, barrier: bool = True
+    ) -> None:
+        """Detach checkpointable workspace backing while preserving VAs."""
+        self.validate_graph_visible_addresses()
+        self.handle.detach_handles(synchronize=synchronize, barrier=barrier)
+
+    def _reset_after_reattach(self, *, barrier: bool = True) -> None:
+        self.handle.lamport_initialize(self.rank, torch.float32)
+        self.buffer_flags.copy_(
+            torch.tensor(
+                [0, 2, self.buffer_size_bytes, 0, 0, 0, 0, 0, 0],
+                dtype=torch.uint32,
+                device=self.buffer_flags.device,
+            )
+        )
+        torch.cuda.synchronize()
+        if barrier:
+            self.comm_backend.barrier()
+
+    def reattach_handles(
+        self,
+        *,
+        comm: Optional[CommBackend] = None,
+        synchronize: bool = True,
+        barrier: bool = True,
+    ) -> None:
+        """Reattach checkpointable backing at the original graph-visible VAs."""
+        self.handle.reattach_handles(
+            comm=comm,
+            synchronize=synchronize,
+            barrier=barrier,
+            zero_local=True,
+        )
+        if comm is not None:
+            self.comm_backend = comm
+        self._reset_after_reattach(barrier=barrier)
+        self.validate_graph_visible_addresses()
 
     def destroy(self) -> None:
         """Destroy workspace and free resources."""
