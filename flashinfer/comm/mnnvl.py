@@ -1214,7 +1214,7 @@ class SymmDeviceMemory:
 
         # Create handle exchanger
         if is_mnnvl_fabric_supported(device_idx):
-            self._exchanger: Optional[HandleExchanger] = FabricHandleExchanger(
+            self._exchanger: HandleExchanger = FabricHandleExchanger(
                 self.comm_backend, self.group_rank, self.group_size
             )
         else:
@@ -1241,10 +1241,8 @@ class SymmDeviceMemory:
     def __del__(self):
         """Destructor - cleanup allocated memory"""
 
-        exchanger = getattr(self, "_exchanger", None)
-        if exchanger is not None:
-            exchanger.close()
-            self._exchanger = None
+        if hasattr(self, "_exchanger"):
+            self._exchanger.close()
 
         # Skip cleanup during Python finalization to avoid segfaults
         # Especially cause the CUDA context could be destroyed at this point.
@@ -1260,10 +1258,8 @@ class SymmDeviceMemory:
 
         if self.signal_pads_dev:
             checkCudaErrors(cuda.cuMemFree(self.signal_pads_dev))
-            self.signal_pads_dev = 0
         if self.uc_ptrs_dev:
             checkCudaErrors(cuda.cuMemFree(self.uc_ptrs_dev))
-            self.uc_ptrs_dev = 0
         if getattr(self, "_mapped", False):
             self._unmap_and_release_physical_handles(log_errors=True)
             self._mapped = False
@@ -1274,8 +1270,6 @@ class SymmDeviceMemory:
                 )
             except Exception as e:
                 logger.warning("Failed to free UC VA: %s", e)
-            self.uc_base_ptr = 0
-            self.total_uc_size = 0
         if self.mc_ptr:
             try:
                 checkCudaErrors(
@@ -1283,7 +1277,6 @@ class SymmDeviceMemory:
                 )
             except Exception as e:
                 logger.warning("Failed to free MC VA: %s", e)
-            self.mc_ptr = 0
 
     def get_graph_visible_addresses(self) -> Dict[str, Any]:
         """Return the VA/layout state captured by graph-visible tensors."""
@@ -1403,10 +1396,7 @@ class SymmDeviceMemory:
         checkCudaErrors(cuda.cuCtxSynchronize())
         self._unmap_and_release_physical_handles()
         self._mapped = False
-        exchanger = getattr(self, "_exchanger", None)
-        if exchanger is not None:
-            exchanger.close()
-            self._exchanger = None
+        self._exchanger.close()
 
     def reattach_handles(
         self,
