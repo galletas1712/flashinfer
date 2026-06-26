@@ -209,27 +209,21 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         for mem_handle in self.mem_handles:
             mem_handle.validate_graph_visible_addresses()
 
-    def detach_handles(
-        self, *, synchronize: bool = True, barrier: bool = True
-    ) -> None:
+    def detach_handles(self) -> None:
         """Detach checkpointable symmetric-memory backing while preserving VAs."""
         self.validate_graph_visible_addresses()
         for mem_handle in self.mem_handles:
-            mem_handle.detach_handles(synchronize=synchronize, barrier=barrier)
+            mem_handle.detach_handles()
 
     def reattach_handles(
         self,
         *,
         comm: Optional[CommBackend] = None,
-        synchronize: bool = True,
-        barrier: bool = True,
     ) -> None:
         """Reattach backing at the preserved graph-visible VAs."""
         for mem_handle in self.mem_handles:
             mem_handle.reattach_handles(
                 comm=comm,
-                synchronize=synchronize,
-                barrier=barrier,
                 zero_local=True,
             )
         lamport_dtype = (
@@ -249,8 +243,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             ctypes_cast(lamport_comm_size_bytes, c_void_p),
             4,
         )
-        if barrier:
-            self.mem_handles[0].comm_backend.barrier()
+        torch.cuda.synchronize()
         self.validate_graph_visible_addresses()
 
     def destroy(self) -> None:
