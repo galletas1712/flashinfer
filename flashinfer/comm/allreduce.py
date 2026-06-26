@@ -222,10 +222,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     ) -> None:
         """Reattach backing at the preserved graph-visible VAs."""
         for mem_handle in self.mem_handles:
-            mem_handle.reattach_handles(
-                comm=comm,
-                zero_local=True,
-            )
+            mem_handle.reattach_handles(comm=comm)
         lamport_dtype = (
             torch.float32 if self.metadata["use_fp32_lamport"] else torch.float16
         )
