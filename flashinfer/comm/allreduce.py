@@ -83,30 +83,6 @@ from .trtllm_mnnvl_ar import trtllm_mnnvl_allreduce
 from .trtllm_mnnvl_ar import trtllm_mnnvl_fused_allreduce_add_rmsnorm
 from .trtllm_mnnvl_ar import trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant
 
-
-def _snapshot_tensor(tensor: torch.Tensor, prefix: str) -> dict[str, Any]:
-    return {
-        f"{prefix}_data_ptr": int(tensor.data_ptr()),
-        f"{prefix}_shape": tuple(tensor.shape),
-        f"{prefix}_stride": tuple(tensor.stride()),
-        f"{prefix}_dtype": str(tensor.dtype),
-        f"{prefix}_device": str(tensor.device),
-    }
-
-
-def _validate_snapshot(expected: dict[str, Any], current: dict[str, Any]) -> None:
-    if set(expected) != set(current):
-        raise RuntimeError(
-            "Graph-visible metadata fields changed: "
-            f"{sorted(current)} != {sorted(expected)}"
-        )
-    for key, expected_value in expected.items():
-        if current[key] != expected_value:
-            raise RuntimeError(
-                f"Graph-visible address field {key} changed: "
-                f"{current[key]!r} != {expected_value!r}"
-            )
-
 # ============================================================================
 # WORKSPACE IMPLEMENTATIONS
 # ============================================================================
@@ -209,14 +185,27 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         return {
             "ipc_handles": [list(handles) for handles in self.ipc_handles],
             "workspace_tensor": self.workspace_tensor.detach().cpu().tolist(),
-            **_snapshot_tensor(self.workspace_tensor, prefix="workspace_tensor"),
+            "workspace_tensor_data_ptr": int(self.workspace_tensor.data_ptr()),
+            "workspace_tensor_shape": tuple(self.workspace_tensor.shape),
+            "workspace_tensor_stride": tuple(self.workspace_tensor.stride()),
+            "workspace_tensor_dtype": str(self.workspace_tensor.dtype),
+            "workspace_tensor_device": str(self.workspace_tensor.device),
         }
 
     def validate_graph_visible_addresses(self) -> None:
         """Validate that workspace pointers captured by CUDA graphs are stable."""
-        _validate_snapshot(
-            self._graph_visible_addresses, self.get_graph_visible_addresses()
-        )
+        current = self.get_graph_visible_addresses()
+        if set(self._graph_visible_addresses) != set(current):
+            raise RuntimeError(
+                "Graph-visible metadata fields changed: "
+                f"{sorted(current)} != {sorted(self._graph_visible_addresses)}"
+            )
+        for key, expected_value in self._graph_visible_addresses.items():
+            if current[key] != expected_value:
+                raise RuntimeError(
+                    f"Graph-visible address field {key} changed: "
+                    f"{current[key]!r} != {expected_value!r}"
+                )
         for mem_handle in self.mem_handles:
             mem_handle.validate_graph_visible_addresses()
 
@@ -228,8 +217,21 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         for mem_handle in self.mem_handles:
             mem_handle.detach_handles(synchronize=synchronize, barrier=barrier)
 
-    def _reset_after_remap(self, *, barrier: bool = True) -> None:
-        """Reinitialize Lamport buffers and flags after physical remap."""
+    def reattach_handles(
+        self,
+        *,
+        comm: Optional[CommBackend] = None,
+        synchronize: bool = True,
+        barrier: bool = True,
+    ) -> None:
+        """Reattach backing at the preserved graph-visible VAs."""
+        for mem_handle in self.mem_handles:
+            mem_handle.reattach_handles(
+                comm=comm,
+                synchronize=synchronize,
+                barrier=barrier,
+                zero_local=True,
+            )
         lamport_dtype = (
             torch.float32 if self.metadata["use_fp32_lamport"] else torch.float16
         )
@@ -249,23 +251,6 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         )
         if barrier:
             self.mem_handles[0].comm_backend.barrier()
-
-    def reattach_handles(
-        self,
-        *,
-        comm: Optional[CommBackend] = None,
-        synchronize: bool = True,
-        barrier: bool = True,
-    ) -> None:
-        """Reattach backing at the preserved graph-visible VAs."""
-        for mem_handle in self.mem_handles:
-            mem_handle.reattach_handles(
-                comm=comm,
-                synchronize=synchronize,
-                barrier=barrier,
-                zero_local=True,
-            )
-        self._reset_after_remap(barrier=barrier)
         self.validate_graph_visible_addresses()
 
     def destroy(self) -> None:
