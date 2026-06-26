@@ -275,25 +275,19 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
                 )
         self.handle.validate_graph_visible_addresses()
 
-    def detach_handles(
-        self, *, synchronize: bool = True, barrier: bool = True
-    ) -> None:
+    def detach_handles(self) -> None:
         """Detach checkpointable workspace backing while preserving VAs."""
         self.validate_graph_visible_addresses()
-        self.handle.detach_handles(synchronize=synchronize, barrier=barrier)
+        self.handle.detach_handles()
 
     def reattach_handles(
         self,
         *,
         comm: Optional[CommBackend] = None,
-        synchronize: bool = True,
-        barrier: bool = True,
     ) -> None:
         """Reattach checkpointable backing at the original graph-visible VAs."""
         self.handle.reattach_handles(
             comm=comm,
-            synchronize=synchronize,
-            barrier=barrier,
             zero_local=True,
         )
         if comm is not None:
@@ -307,8 +301,6 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             )
         )
         torch.cuda.synchronize()
-        if barrier:
-            self.comm_backend.barrier()
         self.validate_graph_visible_addresses()
 
     def destroy(self) -> None:

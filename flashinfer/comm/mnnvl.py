@@ -1359,10 +1359,11 @@ class SymmDeviceMemory:
                     )
                 self.uc_handles[rank] = 0
 
-    def detach_handles(
-        self, *, synchronize: bool = True, barrier: bool = True
-    ) -> None:
-        """Release UC/MC physical mappings while preserving graph-visible VAs."""
+    def detach_handles(self) -> None:
+        """Release UC/MC physical mappings while preserving graph-visible VAs.
+
+        CUDA synchronization is performed internally before unmapping.
+        """
         comm_size = self.comm_backend.Get_size()
         comm_rank = self.comm_backend.Get_rank()
         if comm_size != self.group_size or comm_rank != self.group_rank:
@@ -1382,9 +1383,6 @@ class SymmDeviceMemory:
         if any(mapped_states) and not all(mapped_states):
             raise RuntimeError("Inconsistent symmetric-memory mapped state across ranks")
         if not any(mapped_states):
-            if barrier:
-                self.comm_backend.barrier()
-                self.comm_backend.barrier()
             return
 
         local_metadata = {
@@ -1411,11 +1409,7 @@ class SymmDeviceMemory:
                 )
 
         self.validate_graph_visible_addresses()
-        if synchronize:
-            checkCudaErrors(cuda.cuCtxSynchronize())
-        if barrier:
-            self.comm_backend.barrier()
-
+        checkCudaErrors(cuda.cuCtxSynchronize())
         self._unmap_and_release_physical_handles()
         self._mapped = False
         exchanger = getattr(self, "_exchanger", None)
@@ -1423,18 +1417,16 @@ class SymmDeviceMemory:
             exchanger.close()
             self._exchanger = None
 
-        if barrier:
-            self.comm_backend.barrier()
-
     def reattach_handles(
         self,
         *,
         comm: Optional[CommBackend] = None,
-        synchronize: bool = True,
-        barrier: bool = True,
         zero_local: bool = True,
     ) -> None:
-        """Create fresh UC/MC backing and map it into the original VAs."""
+        """Create fresh UC/MC backing and map it into the original VAs.
+
+        CUDA synchronization is performed internally before remapping.
+        """
         comm_backend = comm or self.comm_backend
         comm_size = comm_backend.Get_size()
         comm_rank = comm_backend.Get_rank()
@@ -1460,9 +1452,6 @@ class SymmDeviceMemory:
                 "is still mapped; call detach_handles before checkpoint reattach"
             )
         if all(mapped_states):
-            if barrier:
-                comm_backend.barrier()
-                comm_backend.barrier()
             return
 
         local_metadata = {
@@ -1489,11 +1478,7 @@ class SymmDeviceMemory:
                 )
 
         self.validate_graph_visible_addresses()
-        if synchronize:
-            checkCudaErrors(cuda.cuCtxSynchronize())
-        if barrier:
-            comm_backend.barrier()
-
+        checkCudaErrors(cuda.cuCtxSynchronize())
         enable_multicast = bool(self.mc_ptr)
         expected_allocation_size = self.allocation_size
         self.comm_backend = comm_backend
@@ -1527,9 +1512,6 @@ class SymmDeviceMemory:
 
         self._mapped = True
         self.validate_graph_visible_addresses()
-
-        if barrier:
-            self.comm_backend.barrier()
 
     def get_signal_pad_ptrs_host(self) -> List[int]:
         """Get the raw array of signal pad pointers to all ranks (including self)"""
@@ -1896,26 +1878,18 @@ class McastGPUBuffer:
         """Validate that graph-visible buffer pointers are stable."""
         self.mcast_device_memory.validate_graph_visible_addresses(expected)
 
-    def detach_handles(
-        self, *, synchronize: bool = True, barrier: bool = True
-    ) -> None:
+    def detach_handles(self) -> None:
         """Detach physical backing while preserving graph-visible VAs."""
-        self.mcast_device_memory.detach_handles(
-            synchronize=synchronize, barrier=barrier
-        )
+        self.mcast_device_memory.detach_handles()
 
     def reattach_handles(
         self,
         *,
         comm: Optional[CommBackend] = None,
-        synchronize: bool = True,
-        barrier: bool = True,
         zero_local: bool = True,
     ) -> None:
         """Reattach physical backing at the original graph-visible VAs."""
         self.mcast_device_memory.reattach_handles(
             comm=comm,
-            synchronize=synchronize,
-            barrier=barrier,
             zero_local=zero_local,
         )
