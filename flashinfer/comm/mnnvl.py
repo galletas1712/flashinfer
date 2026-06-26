@@ -1269,10 +1269,10 @@ class SymmDeviceMemory:
             checkCudaErrors(cuda.cuMemFree(self.signal_pads_dev))
         if self.uc_ptrs_dev:
             checkCudaErrors(cuda.cuMemFree(self.uc_ptrs_dev))
-        if getattr(self, "_mapped", False):
+        if self._mapped:
             self._unmap_and_release_physical_handles(log_errors=True)
             self._mapped = False
-        if getattr(self, "uc_base_ptr", 0):
+        if hasattr(self, "uc_base_ptr") and self.uc_base_ptr:
             try:
                 checkCudaErrors(
                     cuda.cuMemAddressFree(self.uc_base_ptr, self.total_uc_size)
