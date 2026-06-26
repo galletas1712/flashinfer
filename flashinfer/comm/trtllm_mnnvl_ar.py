@@ -286,10 +286,7 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         comm: Optional[CommBackend] = None,
     ) -> None:
         """Reattach checkpointable backing at the original graph-visible VAs."""
-        self.handle.reattach_handles(
-            comm=comm,
-            zero_local=True,
-        )
+        self.handle.reattach_handles(comm=comm)
         if comm is not None:
             self.comm_backend = comm
         self.handle.lamport_initialize(self.rank, torch.float32)

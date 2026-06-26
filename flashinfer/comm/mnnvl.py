@@ -1402,7 +1402,6 @@ class SymmDeviceMemory:
         self,
         *,
         comm: Optional[CommBackend] = None,
-        zero_local: bool = True,
     ) -> None:
         """Create fresh UC/MC backing and map it into the original VAs.
 
@@ -1483,13 +1482,6 @@ class SymmDeviceMemory:
         if enable_multicast:
             self._create_and_import_multicast_handle(mc_prop)
             self._map_and_bind_multicast_buffer()
-
-        if zero_local:
-            checkCudaErrors(
-                cuda.cuMemsetD8(
-                    self.uc_ptrs[self.group_rank], 0, self.allocation_size
-                )
-            )
 
         self._mapped = True
         self.validate_graph_visible_addresses()
@@ -1867,10 +1859,6 @@ class McastGPUBuffer:
         self,
         *,
         comm: Optional[CommBackend] = None,
-        zero_local: bool = True,
     ) -> None:
         """Reattach physical backing at the original graph-visible VAs."""
-        self.mcast_device_memory.reattach_handles(
-            comm=comm,
-            zero_local=zero_local,
-        )
+        self.mcast_device_memory.reattach_handles(comm=comm)
