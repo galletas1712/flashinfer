@@ -766,7 +766,6 @@ class MoeAlltoAll:
             self.mnnvl_mem.ptr,
             comm=comm,
             config=None if comm is not None else self.mnnvl_config,
-            zero_local=False,
         )
         refreshed_metainfo = moe_a2a_initialize(
             self.workspace,
