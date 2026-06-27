@@ -770,8 +770,10 @@ class MoeAlltoAll:
         """Release MNNVL mappings while preserving workspace tensor pointers."""
         if self._state.phase != "idle":
             raise RuntimeError("Cannot detach MNNVL workspace during an active A2A phase")
+        torch.cuda.synchronize()
         self.validate_graph_visible_addresses()
         self.mnnvl_mem.detach_handles()
+        torch.cuda.synchronize()
 
     def reattach_handles(
         self,
@@ -779,6 +781,7 @@ class MoeAlltoAll:
         comm: Optional[CommBackend] = None,
     ) -> None:
         """Reattach MNNVL workspace at the original VA and refresh local state."""
+        torch.cuda.synchronize()
         MnnvlMemory._reattach_mnnvl_handles(
             self.mnnvl_mem.ptr,
             comm=comm,
@@ -797,6 +800,7 @@ class MoeAlltoAll:
             )
         self.validate_graph_visible_addresses()
         self._state = _A2AState()
+        torch.cuda.synchronize()
 
     def _reset_workspace(self):
         """Reset the workspace to free up its state. This is mainly used for testing. Use this with caution. This object is no longer usable after this."""
