@@ -687,9 +687,7 @@ class MnnvlMemory:  # type: ignore[no-redef]
                     )
                 )
                 mem_handles[i] = imported_mem_handle
-            checkCudaErrors(
-                cuda.cuMemMap(rank_ptr, aligned_size, 0, mem_handles[i], 0)
-            )
+            checkCudaErrors(cuda.cuMemMap(rank_ptr, aligned_size, 0, mem_handles[i], 0))
             checkCudaErrors(cuda.cuMemSetAccess(rank_ptr, aligned_size, [madesc], 1))
 
         return mem_handles
@@ -793,9 +791,7 @@ class MnnvlMemory:  # type: ignore[no-redef]
             MnnvlMemory.address_refcnt.pop(record.start_address)
             device_ptr = cuda.CUdeviceptr(record.start_address)
             checkCudaErrors(
-                cuda.cuMemAddressFree(
-                    device_ptr, record.comm_size * record.rank_stride
-                )
+                cuda.cuMemAddressFree(device_ptr, record.comm_size * record.rank_stride)
             )
             if record.start_address == MnnvlMemory.current_start_address:
                 MnnvlMemory.current_start_address = 0
@@ -1365,7 +1361,9 @@ class SymmDeviceMemory:
                 f"{len(mapped_states)} ranks, expected {self.group_size}"
             )
         if any(mapped_states) and not all(mapped_states):
-            raise RuntimeError("Inconsistent symmetric-memory mapped state across ranks")
+            raise RuntimeError(
+                "Inconsistent symmetric-memory mapped state across ranks"
+            )
         if not any(mapped_states):
             return
 
@@ -1425,7 +1423,9 @@ class SymmDeviceMemory:
                 f"{len(mapped_states)} ranks, expected {self.group_size}"
             )
         if any(mapped_states) and not all(mapped_states):
-            raise RuntimeError("Inconsistent symmetric-memory mapped state across ranks")
+            raise RuntimeError(
+                "Inconsistent symmetric-memory mapped state across ranks"
+            )
         if comm_backend is not self.comm_backend and any(mapped_states):
             raise RuntimeError(
                 "Cannot refresh symmetric-memory communicator while allocation "

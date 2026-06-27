@@ -769,7 +769,9 @@ class MoeAlltoAll:
     def detach_handles(self) -> None:
         """Release MNNVL mappings while preserving workspace tensor pointers."""
         if self._state.phase != "idle":
-            raise RuntimeError("Cannot detach MNNVL workspace during an active A2A phase")
+            raise RuntimeError(
+                "Cannot detach MNNVL workspace during an active A2A phase"
+            )
         torch.cuda.synchronize()
         self.validate_graph_visible_addresses()
         self.mnnvl_mem.detach_handles()
