@@ -49,6 +49,8 @@ from .allreduce import allreduce_fusion as allreduce_fusion
 from .allreduce import (
     create_allreduce_fusion_workspace as create_allreduce_fusion_workspace,
 )
+from .allgather import SymmetricAllGatherWorkspace as SymmetricAllGatherWorkspace
+from .allgather import symmetric_all_gather as symmetric_all_gather
 
 # MNNVL A2A (Throughput Backend)
 from .trtllm_moe_alltoall import MoeAlltoAll as MoeAlltoAll
