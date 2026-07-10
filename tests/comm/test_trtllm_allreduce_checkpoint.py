@@ -6,6 +6,19 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
+def test_mnnvl_buffer_flags_remain_mutable_after_inference_mode() -> None:
+    from flashinfer.comm.trtllm_mnnvl_ar import _allocate_buffer_flags
+
+    with torch.inference_mode():
+        flags = _allocate_buffer_flags(1024, torch.device("cpu"))
+
+    assert not torch.is_inference(flags)
+    data_ptr = flags.data_ptr()
+    flags.copy_(torch.zeros_like(flags))
+    assert flags.data_ptr() == data_ptr
+    assert not torch.any(flags)
+
+
 def test_checkpoint_lifecycle_rejects_torch_symmetric_memory_backing() -> None:
     from flashinfer.comm.allreduce import (
         MNNVLAllReduceFusionWorkspace,

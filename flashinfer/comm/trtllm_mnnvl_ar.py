@@ -58,6 +58,18 @@ class MNNVLQuantType:
     DYNAMIC_FP8 = 3
 
 
+def _allocate_buffer_flags(
+    buffer_size_bytes: int, device: torch.device
+) -> torch.Tensor:
+    num_bytes_to_clear = [0] * 4
+    with torch.inference_mode(False):
+        return torch.tensor(
+            [0, 2, buffer_size_bytes, 0, *num_bytes_to_clear, 0],
+            dtype=torch.uint32,
+            device=device,
+        )
+
+
 class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     NUM_LAMPORT_BUFFERS = 3
 
@@ -175,12 +187,7 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         # Should have the same lifetime with self._buffer
         # The flag should be binded to each buffer allocation
         # Layout: [cur idx, dirty idx, bytes per buffer, dirty num stages, numBytesToClear[4], access count ptr]
-        num_bytes_to_clear = [0] * 4
-        self.buffer_flags = torch.tensor(
-            [0, 2, self.buffer_size_bytes, 0, *num_bytes_to_clear, 0],
-            dtype=torch.uint32,
-            device=torch.device("cuda", torch.cuda.current_device()),
-        )
+        self.buffer_flags = _allocate_buffer_flags(self.buffer_size_bytes, device)
 
         self.uc_ptrs_dev = self.handle.get_buffer_ptrs_dev()
         self.uc_ptr_local = self.handle.get_unicast_ptr(self.rank)
