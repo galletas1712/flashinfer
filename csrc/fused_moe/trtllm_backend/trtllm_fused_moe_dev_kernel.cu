@@ -20,10 +20,17 @@
 #include <cutlass/numeric_types.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <cstdlib>
 #include <cub/cub.cuh>
 #include <cuda/functional>
 #include <cuda/std/functional>
 #include <cuda/std/type_traits>
+#include <initializer_list>
+#include <limits>
+#include <string>
+#include <vector>
 
 #include "flashinfer/exception.h"
 #include "flashinfer/trtllm/fused_moe/DevKernel.h"
@@ -960,7 +967,266 @@ __global__ void finalizeDeepSeekKernel(KernelParams params) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace {
+
+bool finalizerDiagnosticEnabled() {
+  auto const* value = std::getenv("FLASHINFER_DIAGNOSTIC_MOE_FINALIZER");
+  return value != nullptr && std::string(value) == "1";
+}
+
+bool shouldRunFinalizerDiagnostic(Data const& data) {
+  return finalizerDiagnosticEnabled() && data.numTokens >= 32768;
+}
+
+size_t dtypeSize(tg::Dtype dtype) {
+  switch (dtype) {
+    case tg::Dtype::Fp16:
+    case tg::Dtype::Bfloat16:
+      return 2;
+    case tg::Dtype::E4m3:
+      return 1;
+    case tg::Dtype::Fp32:
+      return 4;
+    default:
+      return 0;
+  }
+}
+
+uint64_t checkedProduct(std::initializer_list<uint64_t> factors, char const* name) {
+  uint64_t result = 1;
+  for (auto const factor : factors) {
+    FLASHINFER_CHECK(factor == 0 || result <= std::numeric_limits<uint64_t>::max() / factor,
+                     "[FI_FINALIZER_DIAGNOSTIC] byte-size overflow for ", name);
+    result *= factor;
+  }
+  return result;
+}
+
+struct PointerRange {
+  bool available;
+  CUdeviceptr base;
+  size_t size;
+};
+
+PointerRange logPointer(char const* name, void const* ptr, uint64_t requiredBytes,
+                        uint64_t invocation) {
+  if (ptr == nullptr) {
+    std::cerr << "[FI_FINALIZER_DIAGNOSTIC] invocation=" << invocation << " pointer=" << name
+              << " address=null required_bytes=" << requiredBytes << std::endl;
+    return {false, 0, 0};
+  }
+
+  cudaPointerAttributes attributes{};
+  auto const attributeStatus = cudaPointerGetAttributes(&attributes, ptr);
+  if (attributeStatus != cudaSuccess) {
+    std::cerr << "[FI_FINALIZER_DIAGNOSTIC] invocation=" << invocation << " pointer=" << name
+              << " address=" << ptr << " required_bytes=" << requiredBytes
+              << " alignment16=" << (reinterpret_cast<uintptr_t>(ptr) % 16)
+              << " cuda_pointer_status=" << cudaGetErrorString(attributeStatus) << std::endl;
+    cudaGetLastError();
+  } else {
+    std::cerr << "[FI_FINALIZER_DIAGNOSTIC] invocation=" << invocation << " pointer=" << name
+              << " address=" << ptr << " required_bytes=" << requiredBytes
+              << " alignment16=" << (reinterpret_cast<uintptr_t>(ptr) % 16)
+              << " memory_type=" << static_cast<int>(attributes.type)
+              << " device=" << attributes.device << std::endl;
+  }
+
+  CUdeviceptr base = 0;
+  size_t size = 0;
+  auto const rangeStatus =
+      cuMemGetAddressRange(&base, &size, reinterpret_cast<CUdeviceptr>(ptr));
+  if (rangeStatus != CUDA_SUCCESS) {
+    std::cerr << "[FI_FINALIZER_DIAGNOSTIC] invocation=" << invocation << " pointer=" << name
+              << " allocation_range=unavailable cu_status=" << static_cast<int>(rangeStatus)
+              << std::endl;
+    return {false, 0, 0};
+  }
+
+  auto const address = reinterpret_cast<uintptr_t>(ptr);
+  auto const allocationEnd = static_cast<uint64_t>(base) + size;
+  auto const requiredEnd = static_cast<uint64_t>(address) + requiredBytes;
+  auto const contains = address >= static_cast<uintptr_t>(base) && requiredEnd >= address &&
+                        requiredEnd <= allocationEnd;
+  std::cerr << "[FI_FINALIZER_DIAGNOSTIC] invocation=" << invocation << " pointer=" << name
+            << " allocation_base="
+            << reinterpret_cast<void*>(static_cast<uintptr_t>(base))
+            << " allocation_bytes=" << size
+            << " required_end=" << reinterpret_cast<void*>(static_cast<uintptr_t>(requiredEnd))
+            << " contains_required=" << contains << std::endl;
+  return {true, base, size};
+}
+
+bool containsRequired(PointerRange range, void const* ptr, uint64_t requiredBytes) {
+  if (!range.available) {
+    return true;
+  }
+  auto const address = reinterpret_cast<uintptr_t>(ptr);
+  auto const requiredEnd = static_cast<uint64_t>(address) + requiredBytes;
+  return address >= static_cast<uintptr_t>(range.base) && requiredEnd >= address &&
+         requiredEnd <= static_cast<uint64_t>(range.base) + range.size;
+}
+
+void runFinalizerDiagnostic(Data const& data, void* stream, uint64_t invocation) {
+  FLASHINFER_CHECK(data.numTokens >= 0, "[FI_FINALIZER_DIAGNOSTIC] negative numTokens");
+  FLASHINFER_CHECK(data.topK > 0, "[FI_FINALIZER_DIAGNOSTIC] non-positive topK");
+  FLASHINFER_CHECK(data.hiddenDim > 0, "[FI_FINALIZER_DIAGNOSTIC] non-positive hiddenDim");
+  FLASHINFER_CHECK(data.hiddenDimPadded >= data.hiddenDim,
+                   "[FI_FINALIZER_DIAGNOSTIC] hiddenDimPadded is smaller than hiddenDim");
+  FLASHINFER_CHECK(data.inPtr != nullptr, "[FI_FINALIZER_DIAGNOSTIC] inPtr is null");
+  FLASHINFER_CHECK(data.outPtr != nullptr, "[FI_FINALIZER_DIAGNOSTIC] outPtr is null");
+  FLASHINFER_CHECK(data.totalNumPaddedTokens != nullptr,
+                   "[FI_FINALIZER_DIAGNOSTIC] totalNumPaddedTokens is null");
+  FLASHINFER_CHECK(data.expandedIdxToPermutedIdx != nullptr,
+                   "[FI_FINALIZER_DIAGNOSTIC] expandedIdxToPermutedIdx is null");
+
+  int device = -1;
+  CHECK_CUDA_ERROR(cudaGetDevice(&device));
+  std::cerr << "[FI_FINALIZER_DIAGNOSTIC] invocation=" << invocation
+            << " phase=pre_sync device=" << device << " stream=" << stream
+            << " num_tokens=" << data.numTokens << " num_experts=" << data.numExperts
+            << " top_k=" << data.topK << " hidden_dim=" << data.hiddenDim
+            << " hidden_dim_padded=" << data.hiddenDimPadded
+            << " use_pdl=" << data.mUsePdl << std::endl;
+
+  auto const preSyncStatus = cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream));
+  if (preSyncStatus != cudaSuccess) {
+    std::cerr << "[FI_FINALIZER_DIAGNOSTIC] invocation=" << invocation
+              << " phase=pre_sync status=" << cudaGetErrorString(preSyncStatus) << std::endl;
+  }
+  FLASHINFER_CHECK(preSyncStatus == cudaSuccess,
+                   "[FI_FINALIZER_DIAGNOSTIC] CUDA failed before finalizer launch");
+
+  int32_t totalNumPaddedTokens = -1;
+  CHECK_CUDA_ERROR(cudaMemcpy(&totalNumPaddedTokens, data.totalNumPaddedTokens, sizeof(int32_t),
+                              cudaMemcpyDeviceToHost));
+  FLASHINFER_CHECK(totalNumPaddedTokens >= 0,
+                   "[FI_FINALIZER_DIAGNOSTIC] negative totalNumPaddedTokens");
+
+  auto const mapEntries =
+      checkedProduct({static_cast<uint64_t>(data.numTokens), static_cast<uint64_t>(data.topK)},
+                     "permutation map entries");
+  FLASHINFER_CHECK(mapEntries <= std::numeric_limits<size_t>::max() / sizeof(int32_t),
+                   "[FI_FINALIZER_DIAGNOSTIC] permutation map is too large for host inspection");
+  std::vector<int32_t> permutationMap(static_cast<size_t>(mapEntries));
+  CHECK_CUDA_ERROR(cudaMemcpy(permutationMap.data(), data.expandedIdxToPermutedIdx,
+                              permutationMap.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+
+  int32_t minimum = std::numeric_limits<int32_t>::max();
+  int32_t maximum = std::numeric_limits<int32_t>::min();
+  uint64_t sentinelCount = 0;
+  uint64_t invalidNegativeCount = 0;
+  uint64_t invalidUpperCount = 0;
+  size_t firstInvalidIndex = permutationMap.size();
+  int32_t firstInvalidValue = 0;
+  for (size_t index = 0; index < permutationMap.size(); ++index) {
+    auto const value = permutationMap[index];
+    minimum = std::min(minimum, value);
+    maximum = std::max(maximum, value);
+    if (value == -1) {
+      ++sentinelCount;
+    } else if (value < 0) {
+      ++invalidNegativeCount;
+      if (firstInvalidIndex == permutationMap.size()) {
+        firstInvalidIndex = index;
+        firstInvalidValue = value;
+      }
+    } else if (value >= totalNumPaddedTokens) {
+      ++invalidUpperCount;
+      if (firstInvalidIndex == permutationMap.size()) {
+        firstInvalidIndex = index;
+        firstInvalidValue = value;
+      }
+    }
+  }
+  if (permutationMap.empty()) {
+    minimum = 0;
+    maximum = 0;
+  }
+
+  auto const outputElementSize = dtypeSize(data.mDtypeElt);
+  auto const expertWeightElementSize = dtypeSize(data.mDtypeExpW);
+  FLASHINFER_CHECK(outputElementSize != 0,
+                   "[FI_FINALIZER_DIAGNOSTIC] unsupported output dtype");
+  FLASHINFER_CHECK(data.expertWeightsPtr == nullptr || expertWeightElementSize != 0,
+                   "[FI_FINALIZER_DIAGNOSTIC] unsupported expert-weight dtype");
+
+  auto const inputBytes =
+      checkedProduct({static_cast<uint64_t>(totalNumPaddedTokens),
+                      static_cast<uint64_t>(data.hiddenDimPadded), outputElementSize},
+                     "finalizer input");
+  auto const outputBytes =
+      checkedProduct({static_cast<uint64_t>(data.numTokens),
+                      static_cast<uint64_t>(data.hiddenDim), outputElementSize},
+                     "finalizer output");
+  auto const mapBytes = checkedProduct({mapEntries, sizeof(int32_t)}, "permutation map");
+  auto const expertWeightBytes =
+      data.expertWeightsPtr == nullptr
+          ? 0
+          : checkedProduct({mapEntries, expertWeightElementSize}, "expert weights");
+
+  std::cerr << "[FI_FINALIZER_DIAGNOSTIC] invocation=" << invocation
+            << " phase=metadata total_num_padded_tokens=" << totalNumPaddedTokens
+            << " map_entries=" << mapEntries << " map_min=" << minimum
+            << " map_max=" << maximum << " sentinel_count=" << sentinelCount
+            << " invalid_negative_count=" << invalidNegativeCount
+            << " invalid_upper_count=" << invalidUpperCount;
+  if (firstInvalidIndex != permutationMap.size()) {
+    std::cerr << " first_invalid_index=" << firstInvalidIndex
+              << " first_invalid_value=" << firstInvalidValue;
+  }
+  std::cerr << std::endl;
+
+  auto const inputRange = logPointer("in_ptr", data.inPtr, inputBytes, invocation);
+  auto const outputRange = logPointer("out_ptr", data.outPtr, outputBytes, invocation);
+  auto const mapRange =
+      logPointer("expanded_idx_to_permuted_idx", data.expandedIdxToPermutedIdx, mapBytes,
+                 invocation);
+  logPointer("total_num_padded_tokens", data.totalNumPaddedTokens, sizeof(int32_t), invocation);
+  PointerRange expertWeightRange{false, 0, 0};
+  if (data.expertWeightsPtr != nullptr) {
+    expertWeightRange =
+        logPointer("expert_weights", data.expertWeightsPtr, expertWeightBytes, invocation);
+  }
+
+  FLASHINFER_CHECK(containsRequired(inputRange, data.inPtr, inputBytes),
+                   "[FI_FINALIZER_DIAGNOSTIC] input allocation does not contain required bytes");
+  FLASHINFER_CHECK(containsRequired(outputRange, data.outPtr, outputBytes),
+                   "[FI_FINALIZER_DIAGNOSTIC] output allocation does not contain required bytes");
+  FLASHINFER_CHECK(
+      containsRequired(mapRange, data.expandedIdxToPermutedIdx, mapBytes),
+      "[FI_FINALIZER_DIAGNOSTIC] permutation-map allocation does not contain required bytes");
+  FLASHINFER_CHECK(data.expertWeightsPtr == nullptr ||
+                       containsRequired(expertWeightRange, data.expertWeightsPtr, expertWeightBytes),
+                   "[FI_FINALIZER_DIAGNOSTIC] expert-weight allocation does not contain required "
+                   "bytes");
+  FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(data.inPtr) % 16 == 0,
+                   "[FI_FINALIZER_DIAGNOSTIC] finalizer input is not 16-byte aligned");
+  FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(data.outPtr) % 16 == 0,
+                   "[FI_FINALIZER_DIAGNOSTIC] finalizer output is not 16-byte aligned");
+  FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(data.expandedIdxToPermutedIdx) % 16 == 0,
+                   "[FI_FINALIZER_DIAGNOSTIC] permutation map is not 16-byte aligned");
+  FLASHINFER_CHECK(invalidNegativeCount == 0 && invalidUpperCount == 0,
+                   "[FI_FINALIZER_DIAGNOSTIC] permutation map contains out-of-range entries");
+
+  std::cerr << "[FI_FINALIZER_DIAGNOSTIC] invocation=" << invocation
+            << " phase=validated status=ok" << std::endl;
+}
+
+}  // namespace
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 void run(Data const& data, void* stream) {
+  static std::atomic<uint64_t> diagnosticInvocation{0};
+  auto const diagnosticEnabled = shouldRunFinalizerDiagnostic(data);
+  auto const invocation =
+      diagnosticEnabled ? diagnosticInvocation.fetch_add(1, std::memory_order_relaxed) : 0;
+  if (diagnosticEnabled) {
+    runFinalizerDiagnostic(data, stream, invocation);
+  }
+
   if (data.mUseDeepSeekFp8) {
     int const numThreads = 128;
     int const numBlocksX = (data.hiddenDim - 1 + numThreads) / numThreads;
@@ -991,6 +1257,18 @@ void run(Data const& data, void* stream) {
       LAUNCH_TOPK_EXPW(data, finalizeKernelVecLoad, /*numBlocks=*/data.numTokens,
                        /*numThreads=*/FINALIZE_THREADS_PER_BLOCK, 0, stream);
     }
+  }
+
+  if (diagnosticEnabled) {
+    auto const postSyncStatus = cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream));
+    if (postSyncStatus != cudaSuccess) {
+      std::cerr << "[FI_FINALIZER_DIAGNOSTIC] invocation=" << invocation
+                << " phase=post_sync status=" << cudaGetErrorString(postSyncStatus) << std::endl;
+    }
+    FLASHINFER_CHECK(postSyncStatus == cudaSuccess,
+                     "[FI_FINALIZER_DIAGNOSTIC] CUDA failed in finalizer launch");
+    std::cerr << "[FI_FINALIZER_DIAGNOSTIC] invocation=" << invocation
+              << " phase=post_sync status=ok" << std::endl;
   }
 }
 
